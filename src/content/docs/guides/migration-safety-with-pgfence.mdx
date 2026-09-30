@@ -3,161 +3,72 @@ title: Analyze migration safety with pgfence
 slug: migration-safety-with-pgfence
 ---
 
-import Section from "@mdx/Section.astro";
 import Prerequisites from "@mdx/Prerequisites.astro";
 import Callout from "@mdx/Callout.astro";
 import Npm from "@mdx/Npm.astro";
 import Steps from "@mdx/Steps.astro";
 
 <Prerequisites>
+
 - Get started with [PostgreSQL](/docs/get-started-postgresql)
 - [Drizzle Kit](/docs/kit-overview)
-- [Drizzle migrations](/docs/kit-overview#running-migrations)
+- Node.js 20 or later
+
 </Prerequisites>
 
-When you run `drizzle-kit generate`, Drizzle creates plain SQL migration files in your `drizzle/` folder. Before applying those migrations to production, you can use [pgfence](https://pgfence.com) to analyze them for dangerous lock patterns and get safe rewrite suggestions.
+`drizzle-kit generate` produces SQL migration files. For PostgreSQL projects, [pgfence](https://pgfence.com) can analyze those files before deployment and report lock modes, known migration risks, coverage, and safer alternatives where available.
 
-[pgfence](https://github.com/flvmnt/pgfence) is a Postgres migration safety CLI that reads your SQL files and reports:
-
-- **Lock modes** each statement acquires (e.g. `ACCESS EXCLUSIVE`, `SHARE`)
-- **Risk levels** (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`)
-- **Safe rewrite recipes** when a dangerous pattern is detected
-
-This helps you catch migrations that could block reads or writes on busy tables before they ever reach production.
+Static analysis is one part of a migration review. A report with no findings does not prove that a migration is safe for your database, traffic, or deployment process.
 
 ## Install pgfence
 
-<Npm>
-@flvmnt/pgfence -D
-</Npm>
+<Npm>@flvmnt/pgfence@0.8.1 -D</Npm>
 
-## The workflow
-
-The recommended workflow with Drizzle and pgfence is straightforward: **generate, analyze, migrate**.
+## Generate, analyze, review
 
 <Steps>
 
-#### Generate your migration
-
-After making schema changes, generate the SQL migration as usual:
+#### Generate a migration
 
 ```bash copy
 npx drizzle-kit generate
 ```
 
-This creates a new `.sql` file inside your `drizzle/` migrations folder.
+The commands below assume that your configured output directory is `drizzle/` and its migration SQL files are directly inside that directory. Adjust the paths for your configuration.
 
-#### Analyze the migration with pgfence
-
-Run pgfence against the generated SQL file:
+#### Analyze the generated SQL
 
 ```bash copy
-npx --yes @flvmnt/pgfence@0.2.3 analyze drizzle/*.sql
+npx --yes @flvmnt/pgfence@0.8.1 analyze --format drizzle drizzle/*.sql
 ```
 
-pgfence parses each SQL statement using PostgreSQL's actual parser and checks it against known dangerous patterns.
+pgfence reads the generated SQL, including Drizzle's statement-breakpoint comments. It reports known lock and rewrite risks and policy checks such as missing `lock_timeout`. Review the coverage summary and any unsupported statements as well as the findings. Coverage describes what pgfence processed against its supported patterns; it does not certify that every possible database risk was checked.
 
-#### Review the output and apply
+For example, a generated index statement such as this blocks writes while the index is built:
 
-If pgfence reports no issues, you can safely apply the migration:
-
-```bash copy
-npx drizzle-kit migrate
+```sql
+CREATE INDEX "users_name_idx" ON "users" USING btree ("name");
 ```
 
-If pgfence flags a dangerous pattern, review the safe rewrite recipe it provides and adjust your migration accordingly.
+pgfence reports a `SHARE` lock and `MEDIUM` risk for this statement, with a concurrent-index alternative where applicable.
+
+#### Review and plan deployment
+
+Review suggested changes, PostgreSQL version assumptions, table sizes, and application compatibility. Test the migration using the same runner and transaction behavior as production before applying it.
 
 </Steps>
 
-## Understanding pgfence output
-
-Let's say you have a Drizzle schema change that adds a `NOT NULL` column with a default value to an existing table:
-
-```ts copy
-import { pgTable, serial, text, integer } from 'drizzle-orm/pg-core';
-
-export const users = pgTable('users', {
-  id: serial('id').primaryKey(),
-  name: text('name').notNull(),
-  age: integer('age').notNull().default(0), // new column
-});
-```
-
-After running `drizzle-kit generate`, the SQL migration might look like this:
-
-```sql
-ALTER TABLE "users" ADD COLUMN "age" integer NOT NULL DEFAULT 0;
-```
-
-Running `npx --yes @flvmnt/pgfence@0.2.3 analyze drizzle/0001_add_age.sql` produces output like:
-
-<Section>
-```bash copy
-npx --yes @flvmnt/pgfence@0.2.3 analyze drizzle/0001_add_age.sql
-```
-
-```plaintext
-pgfence v0.2.3 — Postgres migration safety analysis
-
-drizzle/0001_add_age.sql
-┌─────────────────────────────────────────────────────────────┐
-│  ADD COLUMN with NOT NULL + DEFAULT                         │
-│  Lock: ACCESS EXCLUSIVE  Risk: LOW (PG11+ instant)          │
-│  Table: users                                               │
-│  Note: Safe on PostgreSQL 11+ (metadata-only operation)     │
-└─────────────────────────────────────────────────────────────┘
-
-Analyzed 1 SQL statement. 0 issues found.
-```
-</Section>
-
-<Callout type="info" title="PostgreSQL version matters">
-Adding a column with a constant `DEFAULT` value is instant (metadata-only) on PostgreSQL 11 and later. On older versions, Postgres rewrites the entire table. pgfence is aware of this distinction and adjusts the risk level accordingly. You can specify `--pg-version 10` to see the older behavior.
+<Callout type="warning" title="Migration runner transactions">
+  `CREATE INDEX CONCURRENTLY` cannot run inside a transaction. A SQL file alone
+  does not show transactions started by Drizzle's migration runner. pgfence can
+  detect explicit SQL transaction statements, but it cannot certify the runner's
+  behavior from generated SQL. Check the runner you use and execute concurrent
+  operations separately when it wraps migrations in a transaction.
 </Callout>
 
-### When pgfence catches a dangerous pattern
+## Check migrations in CI
 
-Consider a migration that creates a non-concurrent index:
-
-```sql
-CREATE INDEX idx_users_name ON users (name);
-```
-
-pgfence flags this because `CREATE INDEX` without `CONCURRENTLY` acquires a `SHARE` lock, which blocks all writes to the table for the duration of the index build:
-
-```plaintext
-drizzle/0002_add_index.sql
-┌─────────────────────────────────────────────────────────────┐
-│  CREATE INDEX (non-concurrent)                              │
-│  Lock: SHARE  Risk: MEDIUM                                  │
-│  Table: users                                               │
-│                                                             │
-│  Safe rewrite:                                              │
-│  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_name      │
-│    ON users (name);                                         │
-└─────────────────────────────────────────────────────────────┘
-```
-
-<Callout type="warning">
-`CREATE INDEX CONCURRENTLY` cannot run inside a transaction. If your migration runner wraps statements in a transaction, you'll need to run this statement separately. pgfence detects and warns about this case too.
-</Callout>
-
-## Common patterns pgfence detects
-
-Here are the most common patterns pgfence checks for in Drizzle-generated migrations:
-
-| Pattern | Lock mode | Risk | Safe alternative |
-|---------|-----------|------|------------------|
-| `ADD COLUMN ... NOT NULL` (no default) | ACCESS EXCLUSIVE | HIGH | Add nullable, backfill, then set NOT NULL |
-| `CREATE INDEX` (non-concurrent) | SHARE | MEDIUM | `CREATE INDEX CONCURRENTLY` |
-| `ALTER COLUMN TYPE` | ACCESS EXCLUSIVE | HIGH | Expand/contract pattern |
-| `ADD CONSTRAINT ... FOREIGN KEY` | ACCESS EXCLUSIVE | HIGH | `NOT VALID` + `VALIDATE CONSTRAINT` |
-| `ADD CONSTRAINT ... UNIQUE` | ACCESS EXCLUSIVE | HIGH | Build concurrent unique index, then `USING INDEX` |
-| `DROP TABLE` | ACCESS EXCLUSIVE | CRITICAL | Separate release |
-
-## CI integration with GitHub Actions
-
-You can add pgfence to your CI pipeline so every pull request that includes migration changes gets automatically analyzed. Here's a GitHub Actions workflow:
+This example analyzes SQL files in the same `drizzle/` directory when a pull request changes that directory. It runs static analysis without a database connection or database credentials.
 
 ```yaml copy
 name: Migration safety check
@@ -165,48 +76,26 @@ name: Migration safety check
 on:
   pull_request:
     paths:
-      - 'drizzle/**'
+      - "drizzle/**"
 
 jobs:
   pgfence:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - run: npm install
-
       - name: Analyze migrations
-        run: npx --yes @flvmnt/pgfence@0.2.3 analyze --ci --max-risk medium --output github drizzle/*.sql
+        run: npx --yes @flvmnt/pgfence@0.8.1 analyze --format drizzle --ci --max-risk low --unknown block drizzle/*.sql
 ```
 
-The `--ci` flag makes pgfence exit with code 1 when any finding exceeds the `--max-risk` threshold. The `--output github` flag formats the output as a markdown summary suitable for GitHub PR comments.
+`--max-risk low` allows findings up to `LOW` risk and fails on `MEDIUM`, `HIGH`, or `CRITICAL` findings. Policy errors also fail the check. `--unknown block` fails when pgfence reports an unanalyzable statement. Unreadable inputs also fail the command.
 
-<Callout type="info" title="Size-aware risk scoring">
-For more accurate risk assessment, pgfence can factor in table sizes. Generate a stats snapshot from your read replica with `pgfence extract-stats` and pass it via `--stats-file pgfence-stats.json`. Tables with over 1 million rows automatically escalate risk levels. See the [pgfence docs](https://pgfence.com) for details.
-</Callout>
-
-## Output formats
-
-pgfence supports multiple output formats that you can choose with the `--output` flag:
-
-```bash copy
-# Default CLI table output
-npx --yes @flvmnt/pgfence@0.2.3 analyze drizzle/*.sql
-
-# Machine-readable JSON
-npx --yes @flvmnt/pgfence@0.2.3 analyze --output json drizzle/*.sql
-
-# GitHub PR comment markdown
-npx --yes @flvmnt/pgfence@0.2.3 analyze --output github drizzle/*.sql
-```
+The example analyzes all matching migration files, including older ones. Review the existing migration history when introducing the check. If you store SQL in subdirectories, use an explicitly recursive file selection and verify that every intended migration is included; the shell glob above covers only `drizzle/*.sql`.
 
 ## Further reading
 
 - [pgfence documentation](https://pgfence.com)
 - [pgfence on GitHub](https://github.com/flvmnt/pgfence)
-- [pgfence on npm](https://www.npmjs.com/package/@flvmnt/pgfence)
 - [Drizzle Kit migrations](/docs/kit-overview#running-migrations)
